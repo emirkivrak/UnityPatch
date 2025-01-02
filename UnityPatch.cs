@@ -10,39 +10,52 @@ using System.Net;
 using System.Security.Cryptography;
 using UnityEngine.Networking;
 
-// Single-file example showing how to:
-// 1) Create a Git patch
-// 2) Upload it to AWS S3 (Signature V4) using UnityWebRequest
-// 3) List existing patches in S3
-// 4) Download a selected patch
-// 5) Apply the patch to your local repo
-
+/// <summary>
+/// UnityPatch: Editor window that allows you to:
+/// 1) List modified files in your Unity (Git) repo and selectively create a patch.
+/// 2) Upload the resulting patch to an AWS S3 bucket.
+/// 3) List existing patches in S3, download them, and apply locally.
+/// 4) Delete patches directly from S3.
+/// 
+/// No third-party libraries are required; it uses:
+/// - Native Git commands via Process.
+/// - UnityWebRequest for AWS interactions with Signature V4.
+/// 
+/// Add this file to an Editor folder (e.g., Assets/UnityPatch/Editor).
+/// </summary>
 public class UnityPatch : EditorWindow
 {
     // AWS S3 fields
     private string awsAccessKey = "";
     private string awsSecretKey = "";
-    private string regionName = "us-east-1";  // e.g., "us-east-1", "eu-west-1"
-    private string bucketName = "";
-    private string serviceName = "s3"; // Typically "s3"
+    private string regionName   = "us-east-1";  // e.g. "us-east-1", "eu-west-1"
+    private string bucketName   = "";
+    private string serviceName  = "s3";         // Typically "s3"
 
     // Git fields
-    private string repoPath = Path.GetFullPath(Application.dataPath + "/../"); 
+    // Default to the root of the Unity project (one level above /Assets)
+    private string repoPath  = Path.GetFullPath(Application.dataPath + "/../");
     private string patchName = "MyPatch";
 
     // For listing/downloading S3 objects
-    private List<string> s3PatchKeys = new List<string>();
-    private Vector2 scrollPos;
-    
+    private List<string> s3PatchKeys    = new List<string>();
+    private Vector2 s3ListScrollPos;
+
+    // For selecting specific modified files
+    private List<string> changedFiles          = new List<string>();
+    private Dictionary<string, bool> fileToggles = new Dictionary<string, bool>();
+    private Vector2 changedFilesScrollPos;
+
+    // EditorPrefs keys
     private const string PREF_AWS_ACCESS_KEY = "PassNow_AWSAccessKey";
     private const string PREF_AWS_SECRET_KEY = "PassNow_AWSSecretKey";
-    private const string PREF_REGION_NAME = "PassNow_RegionName";
-    private const string PREF_BUCKET_NAME = "PassNow_BucketName";
+    private const string PREF_REGION_NAME    = "PassNow_RegionName";
+    private const string PREF_BUCKET_NAME    = "PassNow_BucketName";
 
-    [MenuItem("Tools/PassNow")]
+    [MenuItem("Tools/Unity Patch")]
     public static void ShowWindow()
     {
-        GetWindow<UnityPatch>("Patch Manager");
+        GetWindow<UnityPatch>("Unity Patch");
     }
     
     private void OnEnable()
@@ -50,8 +63,8 @@ public class UnityPatch : EditorWindow
         // Load saved keys
         awsAccessKey = EditorPrefs.GetString(PREF_AWS_ACCESS_KEY, "");
         awsSecretKey = EditorPrefs.GetString(PREF_AWS_SECRET_KEY, "");
-        regionName = EditorPrefs.GetString(PREF_REGION_NAME, "us-east-1");
-        bucketName = EditorPrefs.GetString(PREF_BUCKET_NAME, "");
+        regionName   = EditorPrefs.GetString(PREF_REGION_NAME, "us-east-1");
+        bucketName   = EditorPrefs.GetString(PREF_BUCKET_NAME, "");
     }
 
     private void OnGUI()
@@ -62,40 +75,74 @@ public class UnityPatch : EditorWindow
         regionName   = EditorGUILayout.TextField("Region (e.g. us-east-1)", regionName);
         bucketName   = EditorGUILayout.TextField("Bucket Name", bucketName);
         
-        if (GUILayout.Button("Save Keys"))
+        EditorGUILayout.BeginHorizontal();
+        if (GUILayout.Button("Save Keys", GUILayout.Width(120)))
         {
             SaveKeys();
         }
-        
-        if (GUILayout.Button("Clear Keys"))
+        if (GUILayout.Button("Clear Keys", GUILayout.Width(120)))
         {
             ClearKeys();
         }
-        
-        EditorGUILayout.Space();
+        EditorGUILayout.EndHorizontal();
 
+        EditorGUILayout.Space();
         EditorGUILayout.LabelField("Git Configuration", EditorStyles.boldLabel);
         repoPath  = EditorGUILayout.TextField("Repo Path", repoPath);
         patchName = EditorGUILayout.TextField("Patch Name", patchName);
 
         EditorGUILayout.Space();
 
-        // CREATE & UPLOAD PATCH
+        // --------------------------------------------------------------------
+        // File Selection Section
+        // --------------------------------------------------------------------
+        EditorGUILayout.LabelField("Select Modified Files", EditorStyles.boldLabel);
+        if (GUILayout.Button("Refresh Changed Files"))
+        {
+            RefreshChangedFiles();
+        }
+
+        changedFilesScrollPos = EditorGUILayout.BeginScrollView(changedFilesScrollPos, GUILayout.Height(150));
+        foreach (var file in changedFiles)
+        {
+            // Toggle each file
+            bool currentValue = fileToggles.ContainsKey(file) && fileToggles[file];
+            bool newValue = EditorGUILayout.ToggleLeft(file, currentValue);
+            if (newValue != currentValue)
+            {
+                fileToggles[file] = newValue;
+            }
+        }
+        EditorGUILayout.EndScrollView();
+
+        // Create & Upload Patch (only selected files)
         if (GUILayout.Button("Create + Upload Patch to S3"))
         {
-            string patchFilePath = CreatePatch(patchName, repoPath);
+            List<string> selectedFiles = new List<string>();
+            foreach (var kvp in fileToggles)
+            {
+                if (kvp.Value)
+                {
+                    selectedFiles.Add(kvp.Key);
+                }
+            }
+
+            string patchFilePath = CreatePatch(patchName, repoPath, selectedFiles);
             if (!string.IsNullOrEmpty(patchFilePath))
             {
-                // Upload to S3
                 UploadPatchToS3(patchFilePath);
             }
         }
 
-        // LIST PATCHES
+        // --------------------------------------------------------------------
+        // S3 Patch Listing Section
+        // --------------------------------------------------------------------
+        EditorGUILayout.Space();
+        EditorGUILayout.LabelField("S3 Patch Management", EditorStyles.boldLabel);
+
         if (GUILayout.Button("List Patches in S3"))
         {
             s3PatchKeys.Clear();
-            // Attempt listing
             ListObjectsFromS3((success, objectKeys, error) =>
             {
                 if (success && objectKeys != null)
@@ -110,25 +157,23 @@ public class UnityPatch : EditorWindow
             });
         }
 
-        // Display S3 object keys
         if (s3PatchKeys.Count > 0)
         {
             EditorGUILayout.LabelField("Available Patches in S3:", EditorStyles.boldLabel);
-            scrollPos = EditorGUILayout.BeginScrollView(scrollPos, GUILayout.Height(100));
+            s3ListScrollPos = EditorGUILayout.BeginScrollView(s3ListScrollPos, GUILayout.Height(130));
             foreach (var key in s3PatchKeys)
             {
                 EditorGUILayout.BeginHorizontal();
-                EditorGUILayout.LabelField(key);
+                EditorGUILayout.LabelField(key, GUILayout.Width(position.width - 180));
 
-                // DOWNLOAD button
-                if (GUILayout.Button("Download & Apply", GUILayout.Width(150)))
+                // DOWNLOAD & APPLY
+                if (GUILayout.Button("Download & Apply", GUILayout.Width(120)))
                 {
                     string localPath = Path.Combine(repoPath, key);
                     DownloadPatchFromS3(key, localPath, (downloadSuccess, downloadError) =>
                     {
                         if (downloadSuccess)
                         {
-                            // Apply patch
                             ApplyPatch(localPath, repoPath);
                         }
                         else
@@ -137,15 +182,76 @@ public class UnityPatch : EditorWindow
                         }
                     });
                 }
+
+                // DELETE PATCH
+                if (GUILayout.Button("Delete", GUILayout.Width(60)))
+                {
+                    DeletePatchFromS3(key);
+                }
+
                 EditorGUILayout.EndHorizontal();
             }
             EditorGUILayout.EndScrollView();
         }
     }
 
-    #region 1) Create Patch (Git)
+    #region (A) Refresh Changed Files
+    private void RefreshChangedFiles()
+    {
+        changedFiles = GetModifiedFiles(repoPath);
+        fileToggles.Clear();
+        foreach (var file in changedFiles)
+        {
+            // Default toggle state to false
+            fileToggles[file] = false;
+        }
+    }
 
-    private string CreatePatch(string patchFileName, string workingDirectory)
+    /// <summary>
+    /// Get a list of modified files using "git status --porcelain"
+    /// </summary>
+    private List<string> GetModifiedFiles(string workingDirectory)
+    {
+        List<string> modifiedFiles = new List<string>();
+
+        var processInfo = new ProcessStartInfo("git", "status --porcelain")
+        {
+            WorkingDirectory = workingDirectory,
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        using (var process = Process.Start(processInfo))
+        {
+            process.WaitForExit();
+            string output = process.StandardOutput.ReadToEnd();
+            string error = process.StandardError.ReadToEnd();
+
+            if (!string.IsNullOrEmpty(error))
+            {
+                UnityEngine.Debug.LogError("Git status error: " + error);
+                return modifiedFiles;
+            }
+
+            // Example lines: "M  Assets/Scripts/Player.cs"
+            var lines = output.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var line in lines)
+            {
+                // Skip lines too short or unrecognized
+                if (line.Length <= 3) continue;
+                string filePath = line.Substring(3).Trim();
+                modifiedFiles.Add(filePath);
+            }
+        }
+
+        return modifiedFiles;
+    }
+    #endregion
+
+    #region (B) Create Patch with Selected Files
+    private string CreatePatch(string patchFileName, string workingDirectory, List<string> selectedFiles)
     {
         if (string.IsNullOrEmpty(workingDirectory) || !Directory.Exists(workingDirectory))
         {
@@ -153,11 +259,26 @@ public class UnityPatch : EditorWindow
             return null;
         }
 
+        if (selectedFiles == null || selectedFiles.Count == 0)
+        {
+            UnityEngine.Debug.LogWarning("No files selected for patch.");
+            return null;
+        }
+
         // Construct patch path
         string patchPath = Path.Combine(workingDirectory, patchFileName + ".patch");
 
-        // Example: git diff HEAD --output="MyPatch.patch"
-        string gitCommand = $"diff HEAD --output=\"{patchPath}\"";
+        // Build file list for Git command
+        // e.g., "file1.cs file2.txt"
+        StringBuilder fileArgs = new StringBuilder();
+        foreach (var f in selectedFiles)
+        {
+            // Wrap in quotes for paths with spaces
+            fileArgs.Append($" \"{f}\"");
+        }
+
+        // e.g., git diff HEAD --output="MyPatch.patch" "Assets/Scripts/Player.cs" ...
+        string gitCommand = $"diff HEAD --output=\"{patchPath}\" {fileArgs}";
 
         ProcessStartInfo psi = new ProcessStartInfo("git", gitCommand)
         {
@@ -195,11 +316,14 @@ public class UnityPatch : EditorWindow
             return null;
         }
     }
-
     #endregion
 
-    #region 2) Upload Patch to AWS S3 (Using Signature V4 with UnityWebRequest)
+    #region (C) AWS S3 Interactions
+    // Upload, List, Download, Delete
 
+    /// <summary>
+    /// Upload a patch file to S3 using UnityWebRequest (Signature V4).
+    /// </summary>
     private void UploadPatchToS3(string filePath)
     {
         if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
@@ -208,8 +332,6 @@ public class UnityPatch : EditorWindow
             return;
         }
 
-        // We'll perform a PUT object request to S3: "PUT /{key}"
-        // The host is typically "{bucketName}.s3.{region}.amazonaws.com"
         string fileName = Path.GetFileName(filePath);
         byte[] fileData = File.ReadAllBytes(filePath);
 
@@ -218,22 +340,16 @@ public class UnityPatch : EditorWindow
         string method = "PUT";
 
         Dictionary<string, string> headers = new Dictionary<string, string>();
-        // Populate the necessary AWS Signature V4 headers
         PopulateAWSSignature(headers, method, fileData, host, $"/{fileName}");
 
-        // Start the upload
         UnityWebRequest request = new UnityWebRequest(uri, method);
         request.uploadHandler   = new UploadHandlerRaw(fileData);
         request.downloadHandler = new DownloadHandlerBuffer();
+        request.SetRequestHeader("Content-Type", "application/octet-stream");
 
-        // Add headers to request
         foreach (var kvp in headers)
             request.SetRequestHeader(kvp.Key, kvp.Value);
 
-        // For a PUT, set content-type as needed (e.g. application/octet-stream)
-        request.SetRequestHeader("Content-Type", "application/octet-stream");
-
-        // Send request
         var operation = request.SendWebRequest();
         operation.completed += (op) =>
         {
@@ -254,15 +370,11 @@ public class UnityPatch : EditorWindow
         };
     }
 
-    #endregion
-
-    #region 3) List Objects in AWS S3 (Using UnityWebRequest + Signature V4)
-
-    private void ListObjectsFromS3(System.Action<bool, List<string>, string> callback)
+    /// <summary>
+    /// List patch files in S3 (objects in the bucket).
+    /// </summary>
+    private void ListObjectsFromS3(Action<bool, List<string>, string> callback)
     {
-        // GET request to: "https://{bucket}.s3.{region}.amazonaws.com?list-type=2"
-        // We'll parse the resulting XML for object keys
-
         string host = $"{bucketName}.s3.{regionName}.amazonaws.com";
         string path = "/?list-type=2";
         string uri  = $"https://{host}{path}";
@@ -300,7 +412,6 @@ public class UnityPatch : EditorWindow
 
     private List<string> ParseKeysFromListBucketResult(string xmlText)
     {
-        // Very naive parser for demonstration; a real XML parser is recommended
         List<string> keys = new List<string>();
         const string startTag = "<Key>";
         const string endTag   = "</Key>";
@@ -323,11 +434,10 @@ public class UnityPatch : EditorWindow
         return keys;
     }
 
-    #endregion
-
-    #region 4) Download Patch from S3 (Using UnityWebRequest + Signature V4)
-
-    private void DownloadPatchFromS3(string key, string localPath, System.Action<bool, string> callback)
+    /// <summary>
+    /// Download a patch from S3, then run callback upon completion.
+    /// </summary>
+    private void DownloadPatchFromS3(string key, string localPath, Action<bool, string> callback)
     {
         string host = $"{bucketName}.s3.{regionName}.amazonaws.com";
         string uri  = $"https://{host}/{key}";
@@ -369,10 +479,49 @@ public class UnityPatch : EditorWindow
         };
     }
 
+    /// <summary>
+    /// Delete a patch object from S3 by key name.
+    /// </summary>
+    private void DeletePatchFromS3(string key)
+    {
+        string host   = $"{bucketName}.s3.{regionName}.amazonaws.com";
+        string uri    = $"https://{host}/{key}";
+        string method = "DELETE";
+
+        Dictionary<string, string> headers = new Dictionary<string, string>();
+        PopulateAWSSignature(headers, method, null, host, $"/{key}");
+
+        UnityWebRequest request = new UnityWebRequest(uri, method);
+        request.downloadHandler = new DownloadHandlerBuffer(); // no body needed for DELETE
+
+        // Add the AWS signature headers
+        foreach (var kvp in headers)
+            request.SetRequestHeader(kvp.Key, kvp.Value);
+
+        var operation = request.SendWebRequest();
+        operation.completed += (op) =>
+        {
+#if UNITY_2020_2_OR_NEWER
+            if (request.result != UnityWebRequest.Result.Success)
+#else
+            if (request.isNetworkError || request.isHttpError)
+#endif
+            {
+                UnityEngine.Debug.LogError($"Delete error: {request.error}");
+            }
+            else
+            {
+                UnityEngine.Debug.Log($"Successfully deleted patch '{key}' from S3!");
+                // Optionally refresh the S3 list
+                s3PatchKeys.Remove(key);
+            }
+            request.Dispose();
+        };
+    }
+
     #endregion
 
-    #region 5) Apply Patch (Git)
-
+    #region (D) Apply Patch Locally
     private void ApplyPatch(string patchFilePath, string workingDirectory)
     {
         if (string.IsNullOrEmpty(workingDirectory) || !Directory.Exists(workingDirectory))
@@ -386,7 +535,7 @@ public class UnityPatch : EditorWindow
             return;
         }
 
-        // Example: git apply "MyPatch.patch"
+        // e.g., git apply "MyPatch.patch"
         string gitCommand = $"apply \"{patchFilePath}\"";
 
         ProcessStartInfo psi = new ProcessStartInfo("git", gitCommand)
@@ -422,53 +571,44 @@ public class UnityPatch : EditorWindow
             UnityEngine.Debug.LogError($"Failed to apply patch: {ex.Message}");
         }
     }
-
     #endregion
 
-    #region AWS Signature V4 Helper
+    #region (E) AWS Signature V4 Helper
 
     /// <summary>
-    /// Populates a dictionary with the necessary AWS Signature Version 4 headers.
-    /// - This example uses your Access Key and Secret Key directly (not recommended for production).
-    /// - For large files or advanced usage, consider chunked uploading and robust error handling.
+    /// Adds AWS Signature Version 4 headers to the 'headers' dictionary.
     /// </summary>
-    /// <param name="headers">Dictionary to fill with headers (including Authorization)</param>
-    /// <param name="method">HTTP method (e.g., PUT, GET)</param>
-    /// <param name="body">Request body byte array (null if GET, non-null if PUT)</param>
-    /// <param name="host">Hostname (e.g., bucket.s3.us-east-1.amazonaws.com)</param>
-    /// <param name="canonicalUri">The path part of the URL (e.g., "/myfile.txt" or "/?list-type=2")</param>
     private void PopulateAWSSignature(Dictionary<string, string> headers, string method, byte[] body, string host, string canonicalUri)
     {
-        // Basic setup
-        string region     = regionName;
-        string service    = serviceName; // "s3"
-        DateTime now      = DateTime.UtcNow;
-        string amzDate    = now.ToString("yyyyMMddTHHmmssZ");
-        string dateStamp  = now.ToString("yyyyMMdd"); // For credential scope
+        string region  = regionName;
+        string service = serviceName; // "s3"
+        DateTime now   = DateTime.UtcNow;
 
-        headers["host"]          = host;
-        headers["x-amz-date"]    = amzDate;
+        string amzDate   = now.ToString("yyyyMMddTHHmmssZ");
+        string dateStamp = now.ToString("yyyyMMdd"); // For credential scope
+
+        headers["host"] = host;
+        headers["x-amz-date"] = amzDate;
         headers["x-amz-content-sha256"] = HashSHA256(body ?? new byte[0]);
 
         // Create canonical request
         string signedHeaders = "host;x-amz-content-sha256;x-amz-date";
-        string canonicalHeaders = 
+        string canonicalHeaders =
             $"host:{host}\n" +
             $"x-amz-content-sha256:{headers["x-amz-content-sha256"]}\n" +
             $"x-amz-date:{amzDate}\n";
 
-        string canonicalQueryString = ""; // For listing objects, we included "?list-type=2" in the URI, 
-                                          // but for signing you put that into the canonical query if not in path
+        // If there is a query string, separate it from the path
+        string canonicalQueryString = "";
         if (canonicalUri.Contains("?"))
         {
-            // Very naive approach: separate path from query
             var parts = canonicalUri.Split('?');
             canonicalUri      = parts[0];
             canonicalQueryString = parts.Length > 1 ? parts[1] : "";
         }
 
-        string canonicalRequest = 
-            $"{method}\n" + 
+        string canonicalRequest =
+            $"{method}\n" +
             $"{canonicalUri}\n" +
             $"{canonicalQueryString}\n" +
             $"{canonicalHeaders}\n" +
@@ -478,7 +618,7 @@ public class UnityPatch : EditorWindow
         string hashedCanonicalRequest = HashSHA256(Encoding.UTF8.GetBytes(canonicalRequest));
 
         // Create string to sign
-        string algorithm = "AWS4-HMAC-SHA256";
+        string algorithm       = "AWS4-HMAC-SHA256";
         string credentialScope = $"{dateStamp}/{region}/{service}/aws4_request";
         string stringToSign =
             $"{algorithm}\n" +
@@ -487,12 +627,12 @@ public class UnityPatch : EditorWindow
             hashedCanonicalRequest;
 
         // Calculate the signature
-        byte[] signingKey = GetSignatureKey(awsSecretKey, dateStamp, region, service);
-        byte[] signature  = HmacSHA256(Encoding.UTF8.GetBytes(stringToSign), signingKey);
+        byte[] signingKey  = GetSignatureKey(awsSecretKey, dateStamp, region, service);
+        byte[] signature   = HmacSHA256(Encoding.UTF8.GetBytes(stringToSign), signingKey);
         string signatureHex = ToHexString(signature);
 
         // Create Authorization header
-        string authorization = 
+        string authorization =
             $"{algorithm} Credential={awsAccessKey}/{credentialScope}, " +
             $"SignedHeaders={signedHeaders}, Signature={signatureHex}";
 
@@ -519,10 +659,10 @@ public class UnityPatch : EditorWindow
     // Returns the signing key to sign the request, per AWS docs
     private static byte[] GetSignatureKey(string key, string dateStamp, string regionName, string serviceName)
     {
-        byte[] kDate    = HmacSHA256(System.Text.Encoding.UTF8.GetBytes(dateStamp),  System.Text.Encoding.UTF8.GetBytes("AWS4" + key));
-        byte[] kRegion  = HmacSHA256(System.Text.Encoding.UTF8.GetBytes(regionName), kDate);
-        byte[] kService = HmacSHA256(System.Text.Encoding.UTF8.GetBytes(serviceName), kRegion);
-        byte[] kSigning = HmacSHA256(System.Text.Encoding.UTF8.GetBytes("aws4_request"), kService);
+        byte[] kDate    = HmacSHA256(Encoding.UTF8.GetBytes(dateStamp), Encoding.UTF8.GetBytes("AWS4" + key));
+        byte[] kRegion  = HmacSHA256(Encoding.UTF8.GetBytes(regionName), kDate);
+        byte[] kService = HmacSHA256(Encoding.UTF8.GetBytes(serviceName), kRegion);
+        byte[] kSigning = HmacSHA256(Encoding.UTF8.GetBytes("aws4_request"), kService);
         return kSigning;
     }
 
@@ -536,8 +676,7 @@ public class UnityPatch : EditorWindow
 
     #endregion
 
-    #region EditorPrefs
-
+    #region (F) EditorPrefs Storage
     private void SaveKeys()
     {
         EditorPrefs.SetString(PREF_AWS_ACCESS_KEY, awsAccessKey);
@@ -555,7 +694,6 @@ public class UnityPatch : EditorWindow
         EditorPrefs.DeleteKey(PREF_BUCKET_NAME);
         UnityEngine.Debug.Log("AWS keys cleared.");
     }
-    
     #endregion
 }
 #endif
