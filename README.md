@@ -5,11 +5,21 @@ With Unity Patch, save and share your local changes effortlessly with your team,
 
 ---
 
-## Project Overview
+## Project Overview - Developer Notes
 
 External libraries or third-party installs are **not required**. UnityPatch.cs uses:
 - Web requests for S3 interactions.
 - Your system’s bash environment for git commands.
+
+### Why using a S3 instead of git itself for sharing patch files?
+
+Using a S3 to store patch files serves two main purposes.
+
+First, it prevents adding patch files directly to the repository, avoiding patch files stored in repository. 
+
+Second, it keeps the commit history clean by not committing these patches. Because the patch management system remains external to the main project/Git, history stays simpler and more maintainable.
+
+![Alt text](design.png)
 
 ## Prerequisites
 
