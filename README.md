@@ -3,7 +3,8 @@
 
 With Unity Patch, save and share your local changes effortlessly with your team, without committing to your Git repository.
 
-![Alt text](ss.png)
+<img src="ss.png" alt="drawing" width="500"/>
+
 
 
 ---
